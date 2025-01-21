@@ -5,20 +5,20 @@
 
 import * as os from 'os';
 import * as path from 'path';
-import { Command, commands, Disposable, LineChange, MessageOptions, Position, ProgressLocation, QuickPickItem, Range, SourceControlResourceState, TextDocumentShowOptions, TextEditor, Uri, ViewColumn, window, workspace, WorkspaceEdit, WorkspaceFolder, TimelineItem, env, Selection, TextDocumentContentProvider, InputBoxValidationSeverity, TabInputText, TabInputTextMerge, QuickPickItemKind, TextDocument, LogOutputChannel, l10n, Memento, UIKind, QuickInputButton, ThemeIcon, SourceControlHistoryItem, SourceControl, InputBoxValidationMessage, Tab, TabInputNotebook } from 'vscode';
+import { Command, commands, Disposable, LineChange, MessageOptions, Position, ProgressLocation, QuickPickItem, Range, SourceControlResourceState, TextDocumentShowOptions, TextEditor, Uri, ViewColumn, window, workspace, WorkspaceEdit, WorkspaceFolder, TimelineItem, env, Selection, TextDocumentContentProvider, InputBoxValidationSeverity, TabInputText, TabInputTextMerge, QuickPickItemKind, TextDocument, LogOutputChannel, l10n, Memento, UIKind, QuickInputButton, ThemeIcon, SourceControlHistoryItem, SourceControl, InputBoxValidationMessage, Tab, TabInputNotebook, QuickInputButtonLocation } from 'vscode';
 import TelemetryReporter from '@vscode/extension-telemetry';
 import { uniqueNamesGenerator, adjectives, animals, colors, NumberDictionary } from '@joaomoreno/unique-names-generator';
 import { ForcePushMode, GitErrorCodes, Ref, RefType, Status, CommitOptions, RemoteSourcePublisher, Remote } from './api/git';
 import { Git, Stash } from './git';
 import { Model } from './model';
 import { GitResourceGroup, Repository, Resource, ResourceGroupType } from './repository';
-import { DiffEditorSelectionHunkToolbarContext, applyLineChanges, getModifiedRange, intersectDiffWithRange, invertLineChange, toLineRanges } from './staging';
+import { DiffEditorSelectionHunkToolbarContext, applyLineChanges, getModifiedRange, getWorkingTreeAndIndexDiffInformation, getWorkingTreeDiffInformation, intersectDiffWithRange, invertLineChange, toLineChanges, toLineRanges } from './staging';
 import { fromGitUri, toGitUri, isGitUri, toMergeUris, toMultiFileDiffEditorUris } from './uri';
-import { dispose, grep, isDefined, isDescendant, pathEquals, relativePath } from './util';
+import { dispose, getCommitShortHash, grep, isDefined, isDescendant, pathEquals, relativePath, truncate } from './util';
 import { GitTimelineItem } from './timelineProvider';
 import { ApiRepository } from './api/api1';
 import { getRemoteSourceActions, pickRemoteSource } from './remoteSource';
-import { RemoteSourceAction } from './api/git-base';
+import { RemoteSourceAction } from './typings/git-base';
 
 abstract class CheckoutCommandItem implements QuickPickItem {
 	abstract get label(): string;
@@ -309,7 +309,7 @@ async function categorizeResourceByResolution(resources: Resource[]): Promise<{ 
 	const isBothAddedOrModified = (s: Resource) => s.type === Status.BOTH_MODIFIED || s.type === Status.BOTH_ADDED;
 	const isAnyDeleted = (s: Resource) => s.type === Status.DELETED_BY_THEM || s.type === Status.DELETED_BY_US;
 	const possibleUnresolved = merge.filter(isBothAddedOrModified);
-	const promises = possibleUnresolved.map(s => grep(s.resourceUri.fsPath, /^<{7}|^={7}|^>{7}/));
+	const promises = possibleUnresolved.map(s => grep(s.resourceUri.fsPath, /^<{7}\s|^={7}$|^>{7}\s/));
 	const unresolvedBothModified = await Promise.all<boolean>(promises);
 	const resolved = possibleUnresolved.filter((_s, i) => !unresolvedBothModified[i]);
 	const deletionConflicts = merge.filter(s => isAnyDeleted(s));
@@ -525,9 +525,15 @@ class CheckoutItemsProcessor extends RefItemsProcessor {
 				// Button(s)
 				if (item.refRemote) {
 					const matchingRemote = this.repository.remotes.find((remote) => remote.name === item.refRemote);
-					const remoteUrl = matchingRemote?.pushUrl ?? matchingRemote?.fetchUrl;
-					if (remoteUrl) {
-						item.buttons = this.buttons.get(item.refRemote);
+					const buttons = [];
+					if (matchingRemote?.pushUrl) {
+						buttons.push(...this.buttons.get(matchingRemote.pushUrl) ?? []);
+					}
+					if (matchingRemote?.fetchUrl && matchingRemote.fetchUrl !== matchingRemote.pushUrl) {
+						buttons.push(...this.buttons.get(matchingRemote.fetchUrl) ?? []);
+					}
+					if (buttons.length) {
+						item.buttons = buttons;
 					}
 				} else {
 					item.buttons = this.defaultButtons;
@@ -1339,14 +1345,14 @@ export class CommandCenter {
 
 	@command('git.stage')
 	async stage(...resourceStates: SourceControlResourceState[]): Promise<void> {
-		this.logger.debug(`git.stage ${resourceStates.length} `);
+		this.logger.debug(`[CommandCenter][stage] git.stage ${resourceStates.length} `);
 
 		resourceStates = resourceStates.filter(s => !!s);
 
 		if (resourceStates.length === 0 || (resourceStates[0] && !(resourceStates[0].resourceUri instanceof Uri))) {
 			const resource = this.getSCMResource();
 
-			this.logger.debug(`git.stage.getSCMResource ${resource ? resource.resourceUri.toString() : null} `);
+			this.logger.debug(`[CommandCenter][stage] git.stage.getSCMResource ${resource ? resource.resourceUri.toString() : null} `);
 
 			if (!resource) {
 				return;
@@ -1389,7 +1395,7 @@ export class CommandCenter {
 		const untracked = selection.filter(s => s.resourceGroupType === ResourceGroupType.Untracked);
 		const scmResources = [...workingTree, ...untracked, ...resolved, ...unresolved];
 
-		this.logger.debug(`git.stage.scmResources ${scmResources.length} `);
+		this.logger.debug(`[CommandCenter][stage] git.stage.scmResources ${scmResources.length} `);
 		if (!scmResources.length) {
 			return;
 		}
@@ -1519,16 +1525,20 @@ export class CommandCenter {
 	}
 
 	@command('git.diff.stageHunk')
-	async diffStageHunk(changes: DiffEditorSelectionHunkToolbarContext): Promise<void> {
+	async diffStageHunk(changes: DiffEditorSelectionHunkToolbarContext | undefined): Promise<void> {
 		this.diffStageHunkOrSelection(changes);
 	}
 
 	@command('git.diff.stageSelection')
-	async diffStageSelection(changes: DiffEditorSelectionHunkToolbarContext): Promise<void> {
+	async diffStageSelection(changes: DiffEditorSelectionHunkToolbarContext | undefined): Promise<void> {
 		this.diffStageHunkOrSelection(changes);
 	}
 
-	async diffStageHunkOrSelection(changes: DiffEditorSelectionHunkToolbarContext): Promise<void> {
+	async diffStageHunkOrSelection(changes: DiffEditorSelectionHunkToolbarContext | undefined): Promise<void> {
+		if (!changes) {
+			return;
+		}
+
 		let modifiedUri = changes.modifiedUri;
 		if (!modifiedUri) {
 			const textEditor = window.activeTextEditor;
@@ -1553,11 +1563,21 @@ export class CommandCenter {
 			return;
 		}
 
+		this.logger.trace(`[CommandCenter][stageSelectedChanges] changes: ${JSON.stringify(changes)}`);
+
+		const workingTreeDiffInformation = getWorkingTreeDiffInformation(textEditor);
+		if (workingTreeDiffInformation) {
+			this.logger.trace(`[CommandCenter][stageSelectedChanges] diffInformation: ${JSON.stringify(workingTreeDiffInformation)}`);
+			this.logger.trace(`[CommandCenter][stageSelectedChanges] diffInformation changes: ${JSON.stringify(toLineChanges(workingTreeDiffInformation))}`);
+		}
+
 		const modifiedDocument = textEditor.document;
 		const selectedLines = toLineRanges(textEditor.selections, modifiedDocument);
 		const selectedChanges = changes
-			.map(diff => selectedLines.reduce<LineChange | null>((result, range) => result || intersectDiffWithRange(modifiedDocument, diff, range), null))
+			.map(change => selectedLines.reduce<LineChange | null>((result, range) => result || intersectDiffWithRange(modifiedDocument, change, range), null))
 			.filter(d => !!d) as LineChange[];
+
+		this.logger.trace(`[CommandCenter][stageSelectedChanges] selectedChanges: ${JSON.stringify(selectedChanges)}`);
 
 		if (!selectedChanges.length) {
 			window.showInformationMessage(l10n.t('The selection range does not contain any changes.'));
@@ -1735,6 +1755,14 @@ export class CommandCenter {
 			return;
 		}
 
+		this.logger.trace(`[CommandCenter][revertSelectedRanges] changes: ${JSON.stringify(changes)}`);
+
+		const workingTreeDiffInformation = getWorkingTreeDiffInformation(textEditor);
+		if (workingTreeDiffInformation) {
+			this.logger.trace(`[CommandCenter][revertSelectedRanges] diffInformation: ${JSON.stringify(workingTreeDiffInformation)}`);
+			this.logger.trace(`[CommandCenter][revertSelectedRanges] diffInformation changes: ${JSON.stringify(toLineChanges(workingTreeDiffInformation))}`);
+		}
+
 		const modifiedDocument = textEditor.document;
 		const selections = textEditor.selections;
 		const selectedChanges = changes.filter(change => {
@@ -1746,6 +1774,8 @@ export class CommandCenter {
 			window.showInformationMessage(l10n.t('The selection range does not contain any changes.'));
 			return;
 		}
+
+		this.logger.trace(`[CommandCenter][revertSelectedRanges] selectedChanges: ${JSON.stringify(selectedChanges)}`);
 
 		const selectionsBeforeRevert = textEditor.selections;
 		await this._revertChanges(textEditor, selectedChanges);
@@ -1805,7 +1835,7 @@ export class CommandCenter {
 	}
 
 	@command('git.unstageSelectedRanges', { diff: true })
-	async unstageSelectedRanges(diffs: LineChange[]): Promise<void> {
+	async unstageSelectedRanges(changes: LineChange[]): Promise<void> {
 		const textEditor = window.activeTextEditor;
 
 		if (!textEditor) {
@@ -1825,12 +1855,26 @@ export class CommandCenter {
 			return;
 		}
 
+		this.logger.trace(`[CommandCenter][unstageSelectedRanges] changes: ${JSON.stringify(changes)}`);
+
+		const workingTreeDiffInformation = getWorkingTreeDiffInformation(textEditor);
+		if (workingTreeDiffInformation) {
+			this.logger.trace(`[CommandCenter][unstageSelectedRanges] diffInformation (working tree): ${JSON.stringify(workingTreeDiffInformation)}`);
+			this.logger.trace(`[CommandCenter][unstageSelectedRanges] diffInformation changes (working tree): ${JSON.stringify(toLineChanges(workingTreeDiffInformation))}`);
+		}
+
+		const workingTreeAndIndexDiffInformation = getWorkingTreeAndIndexDiffInformation(textEditor);
+		if (workingTreeAndIndexDiffInformation) {
+			this.logger.trace(`[CommandCenter][unstageSelectedRanges] diffInformation (working tree + index): ${JSON.stringify(workingTreeAndIndexDiffInformation)}`);
+			this.logger.trace(`[CommandCenter][unstageSelectedRanges] diffInformation changes (working tree + index): ${JSON.stringify(toLineChanges(workingTreeAndIndexDiffInformation))}`);
+		}
+
 		const originalUri = toGitUri(modifiedUri, 'HEAD');
 		const originalDocument = await workspace.openTextDocument(originalUri);
 		const selectedLines = toLineRanges(textEditor.selections, modifiedDocument);
-		const selectedDiffs = diffs
-			.map(diff => selectedLines.reduce<LineChange | null>((result, range) => result || intersectDiffWithRange(modifiedDocument, diff, range), null))
-			.filter(d => !!d) as LineChange[];
+		const selectedDiffs = changes
+			.map(change => selectedLines.reduce<LineChange | null>((result, range) => result || intersectDiffWithRange(modifiedDocument, change, range), null))
+			.filter(c => !!c) as LineChange[];
 
 		if (!selectedDiffs.length) {
 			window.showInformationMessage(l10n.t('The selection range does not contain any changes.'));
@@ -1838,8 +1882,11 @@ export class CommandCenter {
 		}
 
 		const invertedDiffs = selectedDiffs.map(invertLineChange);
-		const result = applyLineChanges(modifiedDocument, originalDocument, invertedDiffs);
 
+		this.logger.trace(`[CommandCenter][unstageSelectedRanges] selectedDiffs: ${JSON.stringify(selectedDiffs)}`);
+		this.logger.trace(`[CommandCenter][unstageSelectedRanges] invertedDiffs: ${JSON.stringify(invertedDiffs)}`);
+
+		const result = applyLineChanges(modifiedDocument, originalDocument, invertedDiffs);
 		await this.runByRepository(modifiedUri, async (repository, resource) => await repository.stage(resource, result));
 	}
 
@@ -2063,74 +2110,79 @@ export class CommandCenter {
 			promptToSaveFilesBeforeCommit = 'never';
 		}
 
-		const enableSmartCommit = config.get<boolean>('enableSmartCommit') === true;
+		let enableSmartCommit = config.get<boolean>('enableSmartCommit') === true;
 		const enableCommitSigning = config.get<boolean>('enableCommitSigning') === true;
 		let noStagedChanges = repository.indexGroup.resourceStates.length === 0;
 		let noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
 
-		if (promptToSaveFilesBeforeCommit !== 'never') {
-			let documents = workspace.textDocuments
-				.filter(d => !d.isUntitled && d.isDirty && isDescendant(repository.root, d.uri.fsPath));
+		if (!opts.empty) {
+			if (promptToSaveFilesBeforeCommit !== 'never') {
+				let documents = workspace.textDocuments
+					.filter(d => !d.isUntitled && d.isDirty && isDescendant(repository.root, d.uri.fsPath));
 
-			if (promptToSaveFilesBeforeCommit === 'staged' || repository.indexGroup.resourceStates.length > 0) {
-				documents = documents
-					.filter(d => repository.indexGroup.resourceStates.some(s => pathEquals(s.resourceUri.fsPath, d.uri.fsPath)));
-			}
-
-			if (documents.length > 0) {
-				const message = documents.length === 1
-					? l10n.t('The following file has unsaved changes which won\'t be included in the commit if you proceed: {0}.\n\nWould you like to save it before committing?', path.basename(documents[0].uri.fsPath))
-					: l10n.t('There are {0} unsaved files.\n\nWould you like to save them before committing?', documents.length);
-				const saveAndCommit = l10n.t('Save All & Commit Changes');
-				const commit = l10n.t('Commit Changes');
-				const pick = await window.showWarningMessage(message, { modal: true }, saveAndCommit, commit);
-
-				if (pick === saveAndCommit) {
-					await Promise.all(documents.map(d => d.save()));
-
-					// After saving the dirty documents, if there are any documents that are part of the
-					// index group we have to add them back in order for the saved changes to be committed
+				if (promptToSaveFilesBeforeCommit === 'staged' || repository.indexGroup.resourceStates.length > 0) {
 					documents = documents
 						.filter(d => repository.indexGroup.resourceStates.some(s => pathEquals(s.resourceUri.fsPath, d.uri.fsPath)));
-					await repository.add(documents.map(d => d.uri));
+				}
 
-					noStagedChanges = repository.indexGroup.resourceStates.length === 0;
-					noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
-				} else if (pick !== commit) {
-					return; // do not commit on cancel
+				if (documents.length > 0) {
+					const message = documents.length === 1
+						? l10n.t('The following file has unsaved changes which won\'t be included in the commit if you proceed: {0}.\n\nWould you like to save it before committing?', path.basename(documents[0].uri.fsPath))
+						: l10n.t('There are {0} unsaved files.\n\nWould you like to save them before committing?', documents.length);
+					const saveAndCommit = l10n.t('Save All & Commit Changes');
+					const commit = l10n.t('Commit Changes');
+					const pick = await window.showWarningMessage(message, { modal: true }, saveAndCommit, commit);
+
+					if (pick === saveAndCommit) {
+						await Promise.all(documents.map(d => d.save()));
+
+						// After saving the dirty documents, if there are any documents that are part of the
+						// index group we have to add them back in order for the saved changes to be committed
+						documents = documents
+							.filter(d => repository.indexGroup.resourceStates.some(s => pathEquals(s.resourceUri.fsPath, d.uri.fsPath)));
+						await repository.add(documents.map(d => d.uri));
+
+						noStagedChanges = repository.indexGroup.resourceStates.length === 0;
+						noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
+					} else if (pick !== commit) {
+						return; // do not commit on cancel
+					}
 				}
 			}
-		}
 
-		// no changes, and the user has not configured to commit all in this case
-		if (!noUnstagedChanges && noStagedChanges && !enableSmartCommit && !opts.empty && !opts.all) {
-			const suggestSmartCommit = config.get<boolean>('suggestSmartCommit') === true;
+			// no changes, and the user has not configured to commit all in this case
+			if (!noUnstagedChanges && noStagedChanges && !enableSmartCommit && !opts.all && !opts.amend) {
+				const suggestSmartCommit = config.get<boolean>('suggestSmartCommit') === true;
 
-			if (!suggestSmartCommit) {
-				return;
+				if (!suggestSmartCommit) {
+					return;
+				}
+
+				// prompt the user if we want to commit all or not
+				const message = l10n.t('There are no staged changes to commit.\n\nWould you like to stage all your changes and commit them directly?');
+				const yes = l10n.t('Yes');
+				const always = l10n.t('Always');
+				const never = l10n.t('Never');
+				const pick = await window.showWarningMessage(message, { modal: true }, yes, always, never);
+
+				if (pick === always) {
+					enableSmartCommit = true;
+					config.update('enableSmartCommit', true, true);
+				} else if (pick === never) {
+					config.update('suggestSmartCommit', false, true);
+					return;
+				} else if (pick === yes) {
+					enableSmartCommit = true;
+				} else {
+					// Cancel
+					return;
+				}
 			}
 
-			// prompt the user if we want to commit all or not
-			const message = l10n.t('There are no staged changes to commit.\n\nWould you like to stage all your changes and commit them directly?');
-			const yes = l10n.t('Yes');
-			const always = l10n.t('Always');
-			const never = l10n.t('Never');
-			const pick = await window.showWarningMessage(message, { modal: true }, yes, always, never);
-
-			if (pick === always) {
-				config.update('enableSmartCommit', true, true);
-			} else if (pick === never) {
-				config.update('suggestSmartCommit', false, true);
-				return;
-			} else if (pick !== yes) {
-				return; // do not commit on cancel
+			// smart commit
+			if (enableSmartCommit && !opts.all) {
+				opts = { ...opts, all: noStagedChanges };
 			}
-		}
-
-		if (opts.all === undefined) {
-			opts = { ...opts, all: noStagedChanges };
-		} else if (!opts.all && noStagedChanges && !opts.empty) {
-			opts = { ...opts, all: true };
 		}
 
 		// enable signing of commits if configured
@@ -2162,6 +2214,8 @@ export class CommandCenter {
 			// amend allows changing only the commit message
 			&& !opts.amend
 			&& !opts.empty
+			// merge not in progress
+			&& !repository.mergeInProgress
 			// rebase not in progress
 			&& repository.rebaseCommit === undefined
 		) {
@@ -2485,9 +2539,42 @@ export class CommandCenter {
 		return this._checkout(repository, { treeish });
 	}
 
+	@command('git.graph.checkout', { repository: true })
+	async checkout2(repository: Repository, historyItem?: SourceControlHistoryItem, historyItemRefId?: string): Promise<void> {
+		const historyItemRef = historyItem?.references?.find(r => r.id === historyItemRefId);
+		if (!historyItemRef) {
+			return;
+		}
+
+		const config = workspace.getConfiguration('git', Uri.file(repository.root));
+		const pullBeforeCheckout = config.get<boolean>('pullBeforeCheckout', false) === true;
+
+		// Branch, tag
+		if (historyItemRef.id.startsWith('refs/heads/') || historyItemRef.id.startsWith('refs/tags/')) {
+			await repository.checkout(historyItemRef.name, { pullBeforeCheckout });
+			return;
+		}
+
+		// Remote branch
+		const branches = await repository.findTrackingBranches(historyItemRef.name);
+		if (branches.length > 0) {
+			await repository.checkout(branches[0].name!, { pullBeforeCheckout });
+		} else {
+			await repository.checkoutTracking(historyItemRef.name);
+		}
+	}
+
 	@command('git.checkoutDetached', { repository: true })
 	async checkoutDetached(repository: Repository, treeish?: string): Promise<boolean> {
 		return this._checkout(repository, { detached: true, treeish });
+	}
+
+	@command('git.graph.checkoutDetached', { repository: true })
+	async checkoutDetached2(repository: Repository, historyItem?: SourceControlHistoryItem): Promise<boolean> {
+		if (!historyItem) {
+			return false;
+		}
+		return this._checkout(repository, { detached: true, treeish: historyItem.id });
 	}
 
 	private async _checkout(repository: Repository, opts?: { detached?: boolean; treeish?: string }): Promise<boolean> {
@@ -2515,9 +2602,26 @@ export class CommandCenter {
 			: l10n.t('Select a branch or tag to checkout');
 
 		quickPick.show();
-
 		picks.push(... await createCheckoutItems(repository, opts?.detached));
-		quickPick.items = [...commands, ...picks];
+
+		const setQuickPickItems = () => {
+			switch (true) {
+				case quickPick.value === '':
+					quickPick.items = [...commands, ...picks];
+					break;
+				case commands.length === 0:
+					quickPick.items = picks;
+					break;
+				case picks.length === 0:
+					quickPick.items = commands;
+					break;
+				default:
+					quickPick.items = [...picks, { label: '', kind: QuickPickItemKind.Separator }, ...commands];
+					break;
+			}
+		};
+
+		setQuickPickItems();
 		quickPick.busy = false;
 
 		const choice = await new Promise<QuickPickItem | undefined>(c => {
@@ -2532,22 +2636,7 @@ export class CommandCenter {
 
 				c(undefined);
 			})));
-			disposables.push(quickPick.onDidChangeValue(value => {
-				switch (true) {
-					case value === '':
-						quickPick.items = [...commands, ...picks];
-						break;
-					case commands.length === 0:
-						quickPick.items = picks;
-						break;
-					case picks.length === 0:
-						quickPick.items = commands;
-						break;
-					default:
-						quickPick.items = [...picks, { label: '', kind: QuickPickItemKind.Separator }, ...commands];
-						break;
-				}
-			}));
+			disposables.push(quickPick.onDidChangeValue(() => setQuickPickItems()));
 		});
 
 		dispose(disposables);
@@ -2582,7 +2671,7 @@ export class CommandCenter {
 					await this.cleanAll(repository);
 					await item.run(repository, opts);
 				} else if (choice === stash || choice === migrate) {
-					if (await this._stash(repository)) {
+					if (await this._stash(repository, true)) {
 						await item.run(repository, opts);
 
 						if (choice === migrate) {
@@ -2597,8 +2686,8 @@ export class CommandCenter {
 	}
 
 	@command('git.branch', { repository: true })
-	async branch(repository: Repository): Promise<void> {
-		await this._branch(repository);
+	async branch(repository: Repository, historyItem?: SourceControlHistoryItem): Promise<void> {
+		await this._branch(repository, undefined, false, historyItem?.id);
 	}
 
 	@command('git.branchFrom', { repository: true })
@@ -2696,6 +2785,7 @@ export class CommandCenter {
 			{
 				iconPath: new ThemeIcon('refresh'),
 				tooltip: l10n.t('Regenerate Branch Name'),
+				location: QuickInputButtonLocation.Inline
 			}
 		] : [];
 
@@ -2724,8 +2814,8 @@ export class CommandCenter {
 		return sanitizeBranchName(branchName || '', branchWhitespaceChar);
 	}
 
-	private async _branch(repository: Repository, defaultName?: string, from = false): Promise<void> {
-		let target = 'HEAD';
+	private async _branch(repository: Repository, defaultName?: string, from = false, target?: string): Promise<void> {
+		target = target ?? 'HEAD';
 
 		if (from) {
 			const getRefPicks = async () => {
@@ -2785,10 +2875,24 @@ export class CommandCenter {
 	}
 
 	@command('git.deleteBranch', { repository: true })
-	async deleteBranch(repository: Repository, name: string, force?: boolean): Promise<void> {
+	async deleteBranch(repository: Repository, name: string | undefined, force?: boolean): Promise<void> {
+		await this._deleteBranch(repository, name, force);
+	}
+
+	@command('git.graph.deleteBranch', { repository: true })
+	async deleteBranch2(repository: Repository, historyItem?: SourceControlHistoryItem, historyItemRefId?: string): Promise<void> {
+		const historyItemRef = historyItem?.references?.find(r => r.id === historyItemRefId);
+		if (!historyItemRef) {
+			return;
+		}
+
+		await this._deleteBranch(repository, historyItemRef.name);
+	}
+
+	private async _deleteBranch(repository: Repository, name: string | undefined, force?: boolean): Promise<void> {
 		let run: (force?: boolean) => Promise<void>;
 		if (typeof name === 'string') {
-			run = force => repository.deleteBranch(name, force);
+			run = force => repository.deleteBranch(name!, force);
 		} else {
 			const getBranchPicks = async () => {
 				const refs = await repository.getRefs({ pattern: 'refs/heads' });
@@ -2893,7 +2997,7 @@ export class CommandCenter {
 	}
 
 	@command('git.createTag', { repository: true })
-	async createTag(repository: Repository): Promise<void> {
+	async createTag(repository: Repository, historyItem?: SourceControlHistoryItem): Promise<void> {
 		const inputTagName = await window.showInputBox({
 			placeHolder: l10n.t('Tag name'),
 			prompt: l10n.t('Please provide a tag name'),
@@ -2911,7 +3015,7 @@ export class CommandCenter {
 		});
 
 		const name = inputTagName.replace(/^\.|\/\.|\.\.|~|\^|:|\/$|\.lock$|\.lock\/|\\|\*|\s|^\s*$|\.$/g, '-');
-		await repository.tag(name, inputMessage);
+		await repository.tag({ name, message: inputMessage, ref: historyItem?.id });
 	}
 
 	@command('git.deleteTag', { repository: true })
@@ -2924,10 +3028,19 @@ export class CommandCenter {
 		const placeHolder = l10n.t('Select a tag to delete');
 		const choice = await this.pickRef<TagDeleteItem | QuickPickItem>(tagPicks(), placeHolder);
 
-
 		if (choice instanceof TagDeleteItem) {
 			await choice.run(repository);
 		}
+	}
+
+	@command('git.graph.deleteTag', { repository: true })
+	async deleteTag2(repository: Repository, historyItem?: SourceControlHistoryItem, historyItemRefId?: string): Promise<void> {
+		const historyItemRef = historyItem?.references?.find(r => r.id === historyItemRefId);
+		if (!historyItemRef) {
+			return;
+		}
+
+		await repository.deleteTag(historyItemRef.name);
 	}
 
 	@command('git.deleteRemoteTag', { repository: true })
@@ -3044,7 +3157,8 @@ export class CommandCenter {
 	}
 
 	@command('git.fetchRef', { repository: true })
-	async fetchRef(repository: Repository, ref: string): Promise<void> {
+	async fetchRef(repository: Repository, ref?: string): Promise<void> {
+		ref = ref ?? repository?.historyProvider.currentHistoryItemRemoteRef?.id;
 		if (!repository || !ref) {
 			return;
 		}
@@ -3116,7 +3230,8 @@ export class CommandCenter {
 	}
 
 	@command('git.pullRef', { repository: true })
-	async pullRef(repository: Repository, ref: string): Promise<void> {
+	async pullRef(repository: Repository, ref?: string): Promise<void> {
+		ref = ref ?? repository?.historyProvider.currentHistoryItemRemoteRef?.id;
 		if (!repository || !ref) {
 			return;
 		}
@@ -3263,8 +3378,8 @@ export class CommandCenter {
 	}
 
 	@command('git.pushRef', { repository: true })
-	async pushRef(repository: Repository, ref: string): Promise<void> {
-		if (!repository || !ref) {
+	async pushRef(repository: Repository): Promise<void> {
+		if (!repository) {
 			return;
 		}
 
@@ -3284,6 +3399,20 @@ export class CommandCenter {
 		}
 
 		await repository.cherryPick(hash);
+	}
+
+	@command('git.graph.cherryPick', { repository: true })
+	async cherryPick2(repository: Repository, historyItem?: SourceControlHistoryItem): Promise<void> {
+		if (!historyItem) {
+			return;
+		}
+
+		await repository.cherryPick(historyItem.id);
+	}
+
+	@command('git.cherryPickAbort', { repository: true })
+	async cherryPickAbort(repository: Repository): Promise<void> {
+		await repository.cherryPickAbort();
 	}
 
 	@command('git.pushTo', { repository: true })
@@ -3940,8 +4069,8 @@ export class CommandCenter {
 		const commitParentId = commit.parents.length > 0 ? commit.parents[0] : `${commit.hash}^`;
 		const changes = await repository.diffBetween(commitParentId, commit.hash);
 
-		const title = `${item.shortRef} - ${commit.message}`;
-		const multiDiffSourceUri = toGitUri(Uri.file(repository.root), commit.hash, { scheme: 'git-commit' });
+		const title = `${item.shortRef} - ${truncate(commit.message)}`;
+		const multiDiffSourceUri = Uri.from({ scheme: 'scm-history-item', path: `${repository.root}/${commitParentId}..${commit.hash}` });
 
 		const resources: { originalUri: Uri | undefined; modifiedUri: Uri | undefined }[] = [];
 		for (const change of changes) {
@@ -4181,46 +4310,67 @@ export class CommandCenter {
 		});
 	}
 
+	@command('git.copyCommitId', { repository: true })
+	async copyCommitId(repository: Repository, historyItem: SourceControlHistoryItem): Promise<void> {
+		if (!repository || !historyItem) {
+			return;
+		}
+
+		env.clipboard.writeText(historyItem.id);
+	}
+
+	@command('git.copyCommitMessage', { repository: true })
+	async copyCommitMessage(repository: Repository, historyItem: SourceControlHistoryItem): Promise<void> {
+		if (!repository || !historyItem) {
+			return;
+		}
+
+		env.clipboard.writeText(historyItem.message);
+	}
+
 	@command('git.viewCommit', { repository: true })
-	async viewCommit(repository: Repository, historyItem: SourceControlHistoryItem): Promise<void> {
-		if (!repository || !historyItem) {
+	async viewCommit(repository: Repository, historyItemId: string): Promise<void> {
+		if (!repository || !historyItemId) {
 			return;
 		}
 
-		const commit = await repository.getCommit(historyItem.id);
-		const title = `${historyItem.id.substring(0, 8)} - ${commit.message}`;
+		const rootUri = Uri.file(repository.root);
+		const commit = await repository.getCommit(historyItemId);
+		const title = `${getCommitShortHash(rootUri, historyItemId)} - ${truncate(commit.message)}`;
+		const historyItemParentId = commit.parents.length > 0 ? commit.parents[0] : `${historyItemId}^`;
 
-		const multiDiffSourceUri = toGitUri(Uri.file(repository.root), historyItem.id, { scheme: 'git-commit' });
+		const multiDiffSourceUri = Uri.from({ scheme: 'scm-history-item', path: `${repository.root}/${historyItemParentId}..${historyItemId}` });
 
-		await this._viewChanges(repository, historyItem, multiDiffSourceUri, title);
-	}
-
-	@command('git.viewAllChanges', { repository: true })
-	async viewAllChanges(repository: Repository, historyItem: SourceControlHistoryItem): Promise<void> {
-		if (!repository || !historyItem) {
-			return;
-		}
-
-		const modifiedShortRef = historyItem.id.substring(0, 8);
-		const originalShortRef = historyItem.parentIds.length > 0 ? historyItem.parentIds[0].substring(0, 8) : `${modifiedShortRef}^`;
-		const title = l10n.t('All Changes ({0} ↔ {1})', originalShortRef, modifiedShortRef);
-
-		const multiDiffSourceUri = toGitUri(Uri.file(repository.root), historyItem.id, { scheme: 'git-changes' });
-
-		await this._viewChanges(repository, historyItem, multiDiffSourceUri, title);
-	}
-
-	async _viewChanges(repository: Repository, historyItem: SourceControlHistoryItem, multiDiffSourceUri: Uri, title: string): Promise<void> {
-		const historyItemParentId = historyItem.parentIds.length > 0 ? historyItem.parentIds[0] : `${historyItem.id}^`;
-		const changes = await repository.diffBetween(historyItemParentId, historyItem.id);
-
-		if (changes.length === 0) {
-			return;
-		}
-
-		const resources = changes.map(c => toMultiFileDiffEditorUris(c, historyItemParentId, historyItem.id));
+		const changes = await repository.diffBetween(historyItemParentId, historyItemId);
+		const resources = changes.map(c => toMultiFileDiffEditorUris(c, historyItemParentId, historyItemId));
 
 		await commands.executeCommand('_workbench.openMultiDiffEditor', { multiDiffSourceUri, title, resources });
+	}
+
+	@command('git.copyContentToClipboard')
+	async copyContentToClipboard(content: string): Promise<void> {
+		if (typeof content !== 'string') {
+			return;
+		}
+
+		env.clipboard.writeText(content);
+	}
+
+	@command('git.blame.toggleEditorDecoration')
+	toggleBlameEditorDecoration(): void {
+		this._toggleBlameSetting('blame.editorDecoration.enabled');
+	}
+
+	@command('git.blame.toggleStatusBarItem')
+	toggleBlameStatusBarItem(): void {
+		this._toggleBlameSetting('blame.statusBarItem.enabled');
+	}
+
+	private _toggleBlameSetting(setting: string): void {
+		const config = workspace.getConfiguration('git');
+		const enabled = config.get<boolean>(setting) === true;
+
+		config.update(setting, !enabled, true);
 	}
 
 	private createCommand(id: string, key: string, method: Function, options: ScmCommandOptions): (...args: any[]) => any {
@@ -4309,15 +4459,17 @@ export class CommandCenter {
 						message = l10n.t('Can\'t force push refs to remote. The tip of the remote-tracking branch has been updated since the last checkout. Try running "Pull" first to pull the latest changes from the remote branch first.');
 						break;
 					case GitErrorCodes.Conflict:
-						message = l10n.t('There are merge conflicts. Resolve them before committing.');
+						message = l10n.t('There are merge conflicts. Please resolve them before committing your changes.');
 						type = 'warning';
+						choices.clear();
 						choices.set(l10n.t('Show Changes'), () => commands.executeCommand('workbench.view.scm'));
 						options.modal = false;
 						break;
 					case GitErrorCodes.StashConflict:
-						message = l10n.t('There were merge conflicts while applying the stash.');
-						choices.set(l10n.t('Show Changes'), () => commands.executeCommand('workbench.view.scm'));
+						message = l10n.t('There are merge conflicts while applying the stash. Please resolve them before committing your changes.');
 						type = 'warning';
+						choices.clear();
+						choices.set(l10n.t('Show Changes'), () => commands.executeCommand('workbench.view.scm'));
 						options.modal = false;
 						break;
 					case GitErrorCodes.AuthenticationFailed: {
@@ -4338,6 +4490,18 @@ export class CommandCenter {
 						message = l10n.t('Commit operation was cancelled due to empty commit message.');
 						choices.clear();
 						type = 'information';
+						options.modal = false;
+						break;
+					case GitErrorCodes.CherryPickEmpty:
+						message = l10n.t('The changes are already present in the current branch.');
+						choices.clear();
+						type = 'information';
+						options.modal = false;
+						break;
+					case GitErrorCodes.CherryPickConflict:
+						message = l10n.t('There were merge conflicts while cherry picking the changes. Resolve the conflicts before committing them.');
+						type = 'warning';
+						choices.set(l10n.t('Show Changes'), () => commands.executeCommand('workbench.view.scm'));
 						options.modal = false;
 						break;
 					default: {
@@ -4400,10 +4564,10 @@ export class CommandCenter {
 	private getSCMResource(uri?: Uri): Resource | undefined {
 		uri = uri ? uri : (window.activeTextEditor && window.activeTextEditor.document.uri);
 
-		this.logger.debug(`git.getSCMResource.uri ${uri && uri.toString()}`);
+		this.logger.debug(`[CommandCenter][getSCMResource] git.getSCMResource.uri: ${uri && uri.toString()}`);
 
 		for (const r of this.model.repositories.map(r => r.root)) {
-			this.logger.debug(`repo root ${r}`);
+			this.logger.debug(`[CommandCenter][getSCMResource] repo root: ${r}`);
 		}
 
 		if (!uri) {

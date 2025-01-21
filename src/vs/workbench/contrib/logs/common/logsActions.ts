@@ -3,21 +3,21 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as nls from 'vs/nls';
-import { Action } from 'vs/base/common/actions';
-import { ILoggerService, LogLevel, LogLevelToLocalizedString, isLogLevel } from 'vs/platform/log/common/log';
-import { IQuickInputButton, IQuickInputService, IQuickPickItem, IQuickPickSeparator } from 'vs/platform/quickinput/common/quickInput';
-import { URI } from 'vs/base/common/uri';
-import { IFileService } from 'vs/platform/files/common/files';
-import { IWorkbenchEnvironmentService } from 'vs/workbench/services/environment/common/environmentService';
-import { dirname, basename, isEqual } from 'vs/base/common/resources';
-import { IEditorService } from 'vs/workbench/services/editor/common/editorService';
-import { IOutputChannelDescriptor, IOutputService } from 'vs/workbench/services/output/common/output';
-import { extensionTelemetryLogChannelId, telemetryLogId } from 'vs/platform/telemetry/common/telemetryUtils';
-import { IDefaultLogLevelsService } from 'vs/workbench/contrib/logs/common/defaultLogLevels';
-import { Codicon } from 'vs/base/common/codicons';
-import { ThemeIcon } from 'vs/base/common/themables';
-import { DisposableStore } from 'vs/base/common/lifecycle';
+import * as nls from '../../../../nls.js';
+import { Action } from '../../../../base/common/actions.js';
+import { ILoggerService, LogLevel, LogLevelToLocalizedString, isLogLevel } from '../../../../platform/log/common/log.js';
+import { IQuickInputButton, IQuickInputService, IQuickPickItem, IQuickPickSeparator } from '../../../../platform/quickinput/common/quickInput.js';
+import { URI } from '../../../../base/common/uri.js';
+import { IFileService } from '../../../../platform/files/common/files.js';
+import { IWorkbenchEnvironmentService } from '../../../services/environment/common/environmentService.js';
+import { dirname, basename, isEqual } from '../../../../base/common/resources.js';
+import { IEditorService } from '../../../services/editor/common/editorService.js';
+import { IOutputChannelDescriptor, IOutputService, isSingleSourceOutputChannelDescriptor } from '../../../services/output/common/output.js';
+import { extensionTelemetryLogChannelId, telemetryLogId } from '../../../../platform/telemetry/common/telemetryUtils.js';
+import { IDefaultLogLevelsService } from './defaultLogLevels.js';
+import { Codicon } from '../../../../base/common/codicons.js';
+import { ThemeIcon } from '../../../../base/common/themables.js';
+import { DisposableStore } from '../../../../base/common/lifecycle.js';
 
 type LogLevelQuickPickItem = IQuickPickItem & { level: LogLevel };
 type LogChannelQuickPickItem = IQuickPickItem & { id: string; resource: URI; extensionId?: string };
@@ -52,11 +52,11 @@ export class SetLogLevelAction extends Action {
 		const extensionLogs: LogChannelQuickPickItem[] = [], logs: LogChannelQuickPickItem[] = [];
 		const logLevel = this.loggerService.getLogLevel();
 		for (const channel of this.outputService.getChannelDescriptors()) {
-			if (!SetLogLevelAction.isLevelSettable(channel) || !channel.file) {
+			if (!isSingleSourceOutputChannelDescriptor(channel) || !SetLogLevelAction.isLevelSettable(channel)) {
 				continue;
 			}
-			const channelLogLevel = this.loggerService.getLogLevel(channel.file) ?? logLevel;
-			const item: LogChannelQuickPickItem = { id: channel.id, resource: channel.file, label: channel.label, description: channelLogLevel !== logLevel ? this.getLabel(channelLogLevel) : undefined, extensionId: channel.extensionId };
+			const channelLogLevel = this.loggerService.getLogLevel(channel.source.resource) ?? logLevel;
+			const item: LogChannelQuickPickItem = { id: channel.id, resource: channel.source.resource, label: channel.label, description: channelLogLevel !== logLevel ? this.getLabel(channelLogLevel) : undefined, extensionId: channel.extensionId };
 			if (channel.extensionId) {
 				extensionLogs.push(item);
 			} else {
@@ -75,7 +75,7 @@ export class SetLogLevelAction extends Action {
 
 		return new Promise((resolve, reject) => {
 			const disposables = new DisposableStore();
-			const quickPick = this.quickInputService.createQuickPick();
+			const quickPick = disposables.add(this.quickInputService.createQuickPick({ useSeparators: true }));
 			quickPick.placeholder = nls.localize('selectlog', "Set Log Level");
 			quickPick.items = entries;
 			let selectedItem: IQuickPickItem | undefined;
@@ -97,7 +97,7 @@ export class SetLogLevelAction extends Action {
 	}
 
 	static isLevelSettable(channel: IOutputChannelDescriptor): boolean {
-		return channel.log && channel.file !== undefined && channel.id !== telemetryLogId && channel.id !== extensionTelemetryLogChannelId;
+		return channel.log && isSingleSourceOutputChannelDescriptor(channel) && channel.id !== telemetryLogId && channel.id !== extensionTelemetryLogChannelId;
 	}
 
 	private async setLogLevelForChannel(logChannel: LogChannelQuickPickItem): Promise<void> {
@@ -108,7 +108,7 @@ export class SetLogLevelAction extends Action {
 
 		return new Promise((resolve, reject) => {
 			const disposables = new DisposableStore();
-			const quickPick = this.quickInputService.createQuickPick();
+			const quickPick = disposables.add(this.quickInputService.createQuickPick());
 			quickPick.placeholder = logChannel ? nls.localize('selectLogLevelFor', " {0}: Select log level", logChannel?.label) : nls.localize('selectLogLevel', "Select log level");
 			quickPick.items = entries;
 			quickPick.activeItems = entries.filter((entry) => entry.level === this.loggerService.getLogLevel());

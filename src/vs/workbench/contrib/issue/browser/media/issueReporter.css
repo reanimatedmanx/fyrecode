@@ -3,8 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-
-.mac.web.issue-reporter-body {
+.web.issue-reporter-body {
 	position: absolute;
 	overflow-y: scroll;
 }
@@ -140,7 +139,7 @@
 }
 
 .issue-reporter .mac.web:lang(ko) {
-	font-family: -apple-system, BlinkMacSystemFont, "Nanum Gothic", "Apple SD Gothic Neo", "AppleGothic", sans-serif;
+	font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Nanum Gothic", "AppleGothic", sans-serif;
 }
 
 .issue-reporter .windows.web {
